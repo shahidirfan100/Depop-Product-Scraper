@@ -1,0 +1,59 @@
+{
+    "actorSpecification": 1,
+    "fields": {
+        "product_id": "Depop product identifier",
+        "title": "Listing title",
+        "description": "Listing description",
+        "url": "Canonical Depop product URL",
+        "brand": "Listing brand",
+        "category": "Depop category",
+        "price": "Current listing price",
+        "original_price": "Original price when discounted",
+        "currency": "Price currency",
+        "discount_percentage": "Discount percentage when supplied",
+        "condition": "Listing condition",
+        "colours": "Listing colour attributes",
+        "sizes": "Available sizes and quantities",
+        "primary_image": "Primary product image URL",
+        "image_urls": "All available product image URLs",
+        "location": "Seller listing location",
+        "country": "Seller country code",
+        "seller_username": "Seller username",
+        "like_count": "Listing like count",
+        "listed_quantity": "Available listing quantity",
+        "shipping": "Shipping method and parcel details",
+        "pricing": "Structured pricing breakdown"
+    },
+    "views": {
+        "overview": {
+            "title": "Depop listings",
+            "transformation": {
+                "fields": [
+                    "title",
+                    "brand",
+                    "price",
+                    "currency",
+                    "condition",
+                    "location",
+                    "seller_username",
+                    "primary_image",
+                    "url"
+                ]
+            },
+            "display": {
+                "component": "table",
+                "properties": {
+                    "title": { "label": "Title", "format": "text" },
+                    "brand": { "label": "Brand", "format": "text" },
+                    "price": { "label": "Price", "format": "text" },
+                    "currency": { "label": "Currency", "format": "text" },
+                    "condition": { "label": "Condition", "format": "text" },
+                    "location": { "label": "Location", "format": "text" },
+                    "seller_username": { "label": "Seller", "format": "text" },
+                    "primary_image": { "label": "Image", "format": "image" },
+                    "url": { "label": "Listing", "format": "link" }
+                }
+            }
+        }
+    }
+}

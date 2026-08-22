@@ -1,0 +1,72 @@
+{
+    "title": "Depop Product Scraper",
+    "description": "Collect structured public Depop listings from a search URL or keyword, with sorting and cursor pagination.",
+    "type": "object",
+    "schemaVersion": 1,
+    "properties": {
+        "url": {
+            "title": "Depop search URL",
+            "type": "string",
+            "description": "A Depop search, localized search, category, or filtered search URL. When provided, URL filters are preserved and the URL takes priority over keyword.",
+            "editor": "textfield",
+            "prefill": "https://www.depop.com/search/?q=jersey"
+        },
+        "keyword": {
+            "title": "Keyword",
+            "type": "string",
+            "description": "Search phrase used when URL is empty, for example jersey, vintage Nike, or leather bag.",
+            "editor": "textfield",
+            "prefill": "jersey"
+        },
+        "sort": {
+            "title": "Sorting",
+            "type": "string",
+            "description": "Sort order for matching listings.",
+            "editor": "select",
+            "enum": ["relevance", "newest", "priceAscending", "priceDescending", "popularity"],
+            "enumTitles": ["Most relevant", "Newest", "Price: low to high", "Price: high to low", "Popularity"],
+            "default": "relevance",
+            "prefill": "relevance"
+        },
+        "country": {
+            "title": "Country storefront",
+            "type": "string",
+            "description": "Optional storefront country. A country in a localized URL takes priority when this field is empty.",
+            "editor": "select",
+            "enum": ["us", "uk", "au", "eu", "de", "fr", "it"],
+            "enumTitles": ["United States", "United Kingdom", "Australia", "Europe", "Germany", "France", "Italy"],
+            "default": "us",
+            "prefill": "us"
+        },
+        "results_wanted": {
+            "title": "Results wanted",
+            "type": "integer",
+            "description": "Maximum number of listing records to save.",
+            "minimum": 1,
+            "default": 20,
+            "prefill": 20,
+            "editor": "number"
+        },
+        "max_pages": {
+            "title": "Maximum pages",
+            "type": "integer",
+            "description": "Maximum number of API pages to request. Each page contains up to 24 listings.",
+            "minimum": 1,
+            "default": 10,
+            "prefill": 3,
+            "editor": "number"
+        },
+        "proxyConfiguration": {
+            "title": "Proxy configuration",
+            "type": "object",
+            "description": "Optional Apify Proxy configuration. Residential routing is recommended for protected storefronts.",
+            "editor": "proxy",
+            "default": {
+                "useApifyProxy": true,
+                "apifyProxyGroups": ["RESIDENTIAL"]
+            }
+        }
+    },
+    "required": [],
+    "additionalProperties": false
+}
