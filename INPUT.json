@@ -1,6 +1,5 @@
 {
     "url": "https://www.depop.com/search/?q=jersey",
-    "keyword": "jersey",
     "sort": "relevance",
     "results_wanted": 20,
     "max_pages": 3,

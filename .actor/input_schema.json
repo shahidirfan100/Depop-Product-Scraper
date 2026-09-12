@@ -15,8 +15,7 @@
             "title": "Keyword",
             "type": "string",
             "description": "Search phrase used when URL is empty, for example jersey, vintage Nike, or leather bag.",
-            "editor": "textfield",
-            "prefill": "jersey"
+            "editor": "textfield"
         },
         "sort": {
             "title": "Sorting",

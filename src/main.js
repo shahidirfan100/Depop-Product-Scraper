@@ -1,4 +1,7 @@
 import { randomUUID } from 'node:crypto';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 import { Actor, log } from 'apify';
 import { Impit } from 'impit';
@@ -234,6 +237,44 @@ function newProxySessionId() {
     return randomUUID().replaceAll('-', '');
 }
 
+function getBrowserProxy(proxyUrl) {
+    if (!proxyUrl) return undefined;
+
+    const parsed = new URL(proxyUrl);
+    const proxy = {
+        server: `${parsed.protocol}//${parsed.host}`,
+    };
+
+    if (parsed.username) proxy.username = decodeURIComponent(parsed.username);
+    if (parsed.password) proxy.password = decodeURIComponent(parsed.password);
+    return proxy;
+}
+
+function getProxyGroups(proxyConfig) {
+    return [
+        ...(Array.isArray(proxyConfig?.groups) ? proxyConfig.groups : []),
+        ...(Array.isArray(proxyConfig?.apifyProxyGroups) ? proxyConfig.apifyProxyGroups : []),
+    ];
+}
+
+function usesUnblocker(proxyConfig) {
+    return getProxyGroups(proxyConfig).some((group) => String(group).toUpperCase() === 'UNBLOCKER');
+}
+
+async function getProxyUrl(proxyConfiguration, useSession) {
+    return proxyConfiguration?.newUrl(useSession ? newProxySessionId() : undefined);
+}
+
+async function closeBrowserSession(session) {
+    if (!session) return;
+
+    try {
+        await session.context.close();
+    } finally {
+        if (session.profilePath) await rm(session.profilePath, { force: true, recursive: true });
+    }
+}
+
 async function fetchJson(client, url, headers) {
     for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
         try {
@@ -357,16 +398,19 @@ async function fetchJsonFromBrowser(page, url, headers) {
 }
 
 async function createBrowserApiSession(searchUrl, proxyUrl) {
-    const context = await chromium.launchPersistentContext('./browser-profile', {
-        channel: 'chrome',
-        headless: false,
-        noViewport: true,
-        ...(proxyUrl && { proxy: { server: proxyUrl } }),
-    });
-    const page = await context.newPage();
-    const firstApiResponse = waitForBrowserApiResponse(page, BROWSER_SESSION_WAIT_MS + BROWSER_API_WAIT_MS);
+    const profilePath = await mkdtemp(join(tmpdir(), 'depop-browser-'));
+    let context;
 
     try {
+        context = await chromium.launchPersistentContext(profilePath, {
+            channel: 'chrome',
+            headless: false,
+            noViewport: true,
+            ...(proxyUrl && { proxy: getBrowserProxy(proxyUrl) }),
+        });
+        const page = await context.newPage();
+        const firstApiResponse = waitForBrowserApiResponse(page, BROWSER_SESSION_WAIT_MS + BROWSER_API_WAIT_MS);
+
         await page.goto(searchUrl.href, { waitUntil: 'load', timeout: 90000 });
         await page.waitForTimeout(BROWSER_SESSION_WAIT_MS);
 
@@ -387,15 +431,27 @@ async function createBrowserApiSession(searchUrl, proxyUrl) {
         return {
             context,
             page,
+            profilePath,
             replayHeaders: browserReplayHeaders(captured.headers, searchUrl.href),
         };
     } catch (error) {
-        await context.close();
+        try {
+            if (context) await context.close();
+        } finally {
+            await rm(profilePath, { force: true, recursive: true });
+        }
         throw error;
     }
 }
 
-async function fetchWithBrowserRecovery(searchUrl, primaryUrl, proxyConfiguration, proxyUrl, browserSession) {
+async function fetchWithBrowserRecovery(
+    searchUrl,
+    primaryUrl,
+    proxyConfiguration,
+    proxyUrl,
+    browserSession,
+    useProxySession,
+) {
     let session = browserSession;
 
     if (session) {
@@ -404,7 +460,7 @@ async function fetchWithBrowserRecovery(searchUrl, primaryUrl, proxyConfiguratio
             return { data, browserSession: session };
         } catch (error) {
             log.warning(`Existing browser session failed: ${error.message}; starting a fresh session.`);
-            await session.context.close();
+            await closeBrowserSession(session);
             session = undefined;
         }
     }
@@ -412,8 +468,8 @@ async function fetchWithBrowserRecovery(searchUrl, primaryUrl, proxyConfiguratio
     let lastBrowserError;
     for (let sessionAttempt = 1; sessionAttempt <= MAX_BROWSER_SESSIONS; sessionAttempt++) {
         let browserProxyUrl;
-        if (Actor.isAtHome()) {
-            browserProxyUrl = sessionAttempt === 1 ? proxyUrl : await proxyConfiguration?.newUrl(newProxySessionId());
+        if (proxyUrl || Actor.isAtHome()) {
+            browserProxyUrl = sessionAttempt === 1 ? proxyUrl : await getProxyUrl(proxyConfiguration, useProxySession);
         }
 
         try {
@@ -423,7 +479,7 @@ async function fetchWithBrowserRecovery(searchUrl, primaryUrl, proxyConfiguratio
         } catch (error) {
             lastBrowserError = error;
             if (session) {
-                await session.context.close();
+                await closeBrowserSession(session);
                 session = undefined;
             }
             log.warning(`Browser session ${sessionAttempt}/${MAX_BROWSER_SESSIONS} failed: ${error.message}`);
@@ -455,11 +511,20 @@ async function main() {
         }
 
         const proxyConfig = input.proxyConfiguration;
-        const hasProxy =
-            Boolean(proxyConfig?.useApifyProxy) ||
-            (Array.isArray(proxyConfig?.proxyUrls) && proxyConfig.proxyUrls.length > 0);
-        const proxyConfiguration = hasProxy ? await Actor.createProxyConfiguration({ ...proxyConfig }) : undefined;
-        const proxyUrl = proxyConfiguration ? await proxyConfiguration.newUrl(newProxySessionId()) : undefined;
+        const configuredGroups = getProxyGroups(proxyConfig);
+        const hasCustomProxyUrls = Array.isArray(proxyConfig?.proxyUrls) && proxyConfig.proxyUrls.length > 0;
+        const requestedApifyProxy = Boolean(proxyConfig?.useApifyProxy) || configuredGroups.length > 0;
+        const isApifyCloud = Actor.isAtHome();
+        let proxyConfiguration;
+
+        if (hasCustomProxyUrls || (requestedApifyProxy && isApifyCloud)) {
+            proxyConfiguration = await Actor.createProxyConfiguration({ ...proxyConfig });
+        } else if (requestedApifyProxy) {
+            log.info('Local run detected: ignoring Apify Proxy settings without external proxy credentials.');
+        }
+
+        const useProxySession = !usesUnblocker(proxyConfig);
+        const proxyUrl = proxyConfiguration ? await getProxyUrl(proxyConfiguration, useProxySession) : undefined;
         const client = new Impit({
             browser: 'chrome',
             ignoreTlsErrors: true,
@@ -490,6 +555,7 @@ async function main() {
                     proxyConfiguration,
                     proxyUrl,
                     browserSession,
+                    useProxySession,
                 ));
             } else {
                 const response = await fetchJson(client, primaryUrl, requestHeaders);
@@ -509,6 +575,7 @@ async function main() {
                         proxyConfiguration,
                         proxyUrl,
                         browserSession,
+                        useProxySession,
                     ));
                 }
             }
@@ -547,7 +614,7 @@ async function main() {
         log.info(`Done | saved=${saved} | pages=${pagesProcessed} | stop_reason=${stopReason}`);
     } finally {
         if (browserSession) {
-            await browserSession.context.close();
+            await closeBrowserSession(browserSession);
         }
     }
 }
