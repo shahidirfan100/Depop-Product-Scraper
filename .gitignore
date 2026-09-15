@@ -9,3 +9,6 @@ storage
 package-lock.json
 /.playwright-mcp
 browser-profile
+
+# Added by Apify CLI
+.venv
