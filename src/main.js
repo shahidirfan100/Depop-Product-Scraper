@@ -242,7 +242,7 @@ function getBrowserProxy(proxyUrl) {
 
     const parsed = new URL(proxyUrl);
     const proxy = {
-        server: `${parsed.protocol}//${parsed.host}`,
+        server: `http://${parsed.host}`,
     };
 
     if (parsed.username) proxy.username = decodeURIComponent(parsed.username);
@@ -521,13 +521,17 @@ async function main() {
             proxyConfiguration = await Actor.createProxyConfiguration({ ...proxyConfig });
         } else if (requestedApifyProxy) {
             log.info('Local run detected: ignoring Apify Proxy settings without external proxy credentials.');
+        } else if (isApifyCloud) {
+            proxyConfiguration = await Actor.createProxyConfiguration({
+                useApifyProxy: true,
+                apifyProxyGroups: ['RESIDENTIAL'],
+            });
         }
 
         const useProxySession = !usesUnblocker(proxyConfig);
         const proxyUrl = proxyConfiguration ? await getProxyUrl(proxyConfiguration, useProxySession) : undefined;
         const client = new Impit({
             browser: 'chrome',
-            ignoreTlsErrors: true,
             ...(proxyUrl && { proxyUrl }),
         });
 
