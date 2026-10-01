@@ -12,8 +12,8 @@ const API_PATH = '/presentation/api/v1/search/products/';
 const PAGE_SIZE = 24;
 const MAX_RETRIES = 3;
 const MAX_BROWSER_SESSIONS = 2;
-const BROWSER_SESSION_WAIT_MS = 15000;
-const BROWSER_API_WAIT_MS = 12000;
+const BROWSER_READY_TIMEOUT_MS = 90000;
+const BROWSER_READY_POLL_MS = 4000;
 const SUPPORTED_SORTS = new Set(['relevance', 'newest', 'priceAscending', 'priceDescending', 'popularity']);
 
 function cleanValue(value) {
@@ -305,77 +305,73 @@ async function fetchJson(client, url, headers) {
     throw new Error('Request retries exhausted.');
 }
 
-function isDepopSearchApiUrl(url) {
-    try {
-        const parsed = new URL(url);
-        return parsed.hostname === 'www.depop.com' && parsed.pathname === API_PATH;
-    } catch {
-        return false;
-    }
+function isChallengePage(title) {
+    const trimmed = String(title || '').trim();
+    if (!trimmed) return true;
+    return /just a moment|attention required|checking your browser|verify you are human|^loading\s/i.test(trimmed);
 }
 
-function browserReplayHeaders(capturedHeaders, referer) {
-    const headers = {
-        Accept: capturedHeaders.accept || 'application/json',
-        Referer: capturedHeaders.referer || referer,
-    };
-
-    for (const headerName of ['accept-language', 'depop-device-id', 'depop-session-id', 'depop-search-id']) {
-        if (capturedHeaders[headerName]) headers[headerName] = capturedHeaders[headerName];
-    }
-
-    return headers;
+async function evaluateBrowserFetch(page, url) {
+    return page.evaluate(
+        async ({ targetUrl }) => {
+            const response = await fetch(targetUrl, {
+                credentials: 'include',
+                headers: { Accept: 'application/json' },
+            });
+            return {
+                status: response.status,
+                body: await response.text(),
+            };
+        },
+        { targetUrl: url },
+    );
 }
 
-function waitForBrowserApiResponse(page, timeoutMs) {
-    return new Promise((resolve) => {
-        let settled = false;
-        const timeout = setTimeout(() => {
-            if (settled) return;
-            settled = true;
-            page.off('response', onResponse);
-            resolve(undefined);
-        }, timeoutMs);
+// Depop server-renders search results and gates the whole site behind a Cloudflare
+// challenge. The browser must first clear that challenge before the same-origin
+// JSON API accepts requests, so readiness is confirmed by probing the API itself.
+async function waitForBrowserSession(page, probeUrl, timeoutMs) {
+    const deadline = Date.now() + timeoutMs;
+    let lastStatus = 'no response';
 
-        async function onResponse(response) {
-            if (settled || !isDepopSearchApiUrl(response.url()) || response.status() !== 200) return;
+    while (Date.now() < deadline) {
+        if (page.isClosed()) throw new Error('The browser page closed before the Depop session was ready.');
 
-            try {
-                const data = await response.json();
-                settled = true;
-                clearTimeout(timeout);
-                page.off('response', onResponse);
-                resolve({
-                    data,
-                    headers: response.request().headers(),
-                });
-            } catch {
-                // Another matching response may still contain a readable JSON body.
-            }
+        const title = await page.title().catch(() => '');
+        if (isChallengePage(title)) {
+            await sleep(BROWSER_READY_POLL_MS);
+            continue;
         }
 
-        page.on('response', onResponse);
-    });
+        let probe;
+        try {
+            probe = await evaluateBrowserFetch(page, probeUrl);
+        } catch (error) {
+            lastStatus = error.message;
+            await sleep(BROWSER_READY_POLL_MS);
+            continue;
+        }
+
+        if (probe.status >= 200 && probe.status < 300) return;
+
+        lastStatus = `HTTP ${probe.status}`;
+        await sleep(BROWSER_READY_POLL_MS);
+    }
+
+    throw new Error(`Depop Cloudflare verification did not complete in time (last: ${lastStatus}).`);
 }
 
-async function fetchJsonFromBrowser(page, url, headers) {
+async function fetchJsonFromBrowser(page, url) {
     for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
-        const result = await page.evaluate(
-            async ({ targetUrl, requestHeaders }) => {
-                const response = await fetch(targetUrl, {
-                    credentials: 'include',
-                    headers: {
-                        Accept: 'application/json',
-                        ...requestHeaders,
-                    },
-                });
-                return {
-                    status: response.status,
-                    body: await response.text(),
-                };
-            },
-            { targetUrl: url, requestHeaders: headers },
-        );
+        let result;
+        try {
+            result = await evaluateBrowserFetch(page, url);
+        } catch (error) {
+            if (attempt === MAX_RETRIES) throw error;
+            log.warning(`Browser API retry ${attempt}/${MAX_RETRIES} after error: ${error.message}`);
+            await sleep(attempt * 1500);
+            continue;
+        }
 
         if (result.status >= 200 && result.status < 300) {
             try {
@@ -385,9 +381,9 @@ async function fetchJsonFromBrowser(page, url, headers) {
             }
         }
 
-        if (attempt < MAX_RETRIES && (result.status === 429 || result.status >= 500)) {
+        if (attempt < MAX_RETRIES && [403, 429].includes(result.status)) {
             log.warning(`Browser API retry ${attempt}/${MAX_RETRIES} after HTTP ${result.status}.`);
-            await sleep(attempt * 1500);
+            await sleep(attempt * 2000);
             continue;
         }
 
@@ -397,7 +393,7 @@ async function fetchJsonFromBrowser(page, url, headers) {
     throw new Error('Browser API retries exhausted.');
 }
 
-async function createBrowserApiSession(searchUrl, proxyUrl) {
+async function createBrowserApiSession(probeUrl, proxyUrl) {
     const profilePath = await mkdtemp(join(tmpdir(), 'depop-browser-'));
     let context;
 
@@ -409,31 +405,11 @@ async function createBrowserApiSession(searchUrl, proxyUrl) {
             ...(proxyUrl && { proxy: getBrowserProxy(proxyUrl) }),
         });
         const page = await context.newPage();
-        const firstApiResponse = waitForBrowserApiResponse(page, BROWSER_SESSION_WAIT_MS + BROWSER_API_WAIT_MS);
 
-        await page.goto(searchUrl.href, { waitUntil: 'load', timeout: 90000 });
-        await page.waitForTimeout(BROWSER_SESSION_WAIT_MS);
+        await page.goto('https://www.depop.com/', { waitUntil: 'commit', timeout: 60000 });
+        await waitForBrowserSession(page, probeUrl, BROWSER_READY_TIMEOUT_MS);
 
-        // Depop commonly issues the search request when the result area is brought
-        // into view. This only triggers the site's own API request; no DOM data is read.
-        await page.evaluate(() => window.scrollBy(0, Math.max(window.innerHeight * 2, 1200)));
-        let captured = await firstApiResponse;
-
-        if (!captured) {
-            await page.evaluate(() => window.scrollBy(0, Math.max(window.innerHeight * 2, 1200)));
-            captured = await waitForBrowserApiResponse(page, BROWSER_API_WAIT_MS);
-        }
-
-        if (!captured) {
-            throw new Error('The browser session did not produce a successful Depop search API response.');
-        }
-
-        return {
-            context,
-            page,
-            profilePath,
-            replayHeaders: browserReplayHeaders(captured.headers, searchUrl.href),
-        };
+        return { context, page, profilePath };
     } catch (error) {
         try {
             if (context) await context.close();
@@ -444,19 +420,12 @@ async function createBrowserApiSession(searchUrl, proxyUrl) {
     }
 }
 
-async function fetchWithBrowserRecovery(
-    searchUrl,
-    primaryUrl,
-    proxyConfiguration,
-    proxyUrl,
-    browserSession,
-    useProxySession,
-) {
+async function fetchWithBrowserRecovery(primaryUrl, proxyConfiguration, proxyUrl, browserSession, useProxySession) {
     let session = browserSession;
 
     if (session) {
         try {
-            const data = await fetchJsonFromBrowser(session.page, primaryUrl, session.replayHeaders);
+            const data = await fetchJsonFromBrowser(session.page, primaryUrl);
             return { data, browserSession: session };
         } catch (error) {
             log.warning(`Existing browser session failed: ${error.message}; starting a fresh session.`);
@@ -473,8 +442,8 @@ async function fetchWithBrowserRecovery(
         }
 
         try {
-            session = await createBrowserApiSession(searchUrl, browserProxyUrl);
-            const data = await fetchJsonFromBrowser(session.page, primaryUrl, session.replayHeaders);
+            session = await createBrowserApiSession(primaryUrl, browserProxyUrl);
+            const data = await fetchJsonFromBrowser(session.page, primaryUrl);
             return { data, browserSession: session };
         } catch (error) {
             lastBrowserError = error;
@@ -554,7 +523,6 @@ async function main() {
             let data;
             if (browserSession) {
                 ({ data, browserSession } = await fetchWithBrowserRecovery(
-                    searchUrl,
                     primaryUrl,
                     proxyConfiguration,
                     proxyUrl,
@@ -574,7 +542,6 @@ async function main() {
                         `Direct JSON request returned HTTP ${response.status}; bootstrapping a browser API session.`,
                     );
                     ({ data, browserSession } = await fetchWithBrowserRecovery(
-                        searchUrl,
                         primaryUrl,
                         proxyConfiguration,
                         proxyUrl,
