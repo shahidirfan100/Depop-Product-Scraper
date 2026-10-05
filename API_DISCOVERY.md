@@ -76,7 +76,7 @@ The successful response had this shape:
 
 ## Implementation decision
 
-1. A single bounded Impit probe still runs first. It is a fast path for any IP that is not challenged; on a challenged IP it returns HTTP 403 immediately (no retry) and the actor falls back without wasting time.
+1. A bounded Impit fast path still runs first. It rotates once through a small pool of known-good TLS profiles (`chrome`, `chrome142`, `firefox`, `okhttp5`). On a challenged IP it returns HTTP 403/410 and stops rotating immediately; any thrown transport error (TLS, connect, timeout) is also treated as a recovery signal, never a fatal stop, and the actor falls back to the browser session without wasting time.
 2. Recovery opens the public Depop homepage in Patchright (persistent Chrome context). It waits for the Cloudflare challenge to clear and then confirms readiness by probing the same-origin API until it returns 2xx.
 3. Pages are fetched with `page.evaluate(fetch(...))` from that same origin using the session cookies, and paginated with `page_info.last` as the `after` parameter.
 4. The browser bootstrap reads only JSON API responses. It does not use DOM selectors, HTML parsing, JSON-LD, RSC extraction, or intercepted request headers.
@@ -84,6 +84,58 @@ The successful response had this shape:
 If a browser session still receives a temporary block, one bounded retry rotates to a new Apify Proxy session when proxying is configured.
 
 URL filters are translated into API parameters where the endpoint exposes the same filter. Search, localized search, category, and filtered search URLs are supported. A keyword is converted into the same `what` parameter when no URL is supplied. A URL takes precedence over the keyword.
+
+## Resilience and proxy matrix (verified 2026-10-05)
+
+Read this section first whenever a run fails.
+
+### Impit browser profiles
+
+Every documented `Impit` profile was probed against the live endpoint. Profiles split into two clear groups:
+
+| Profiles                                                                               | TLS handshake                           | Response                      | Decision                                          |
+| -------------------------------------------------------------------------------------- | --------------------------------------- | ----------------------------- | ------------------------------------------------- |
+| `chrome`, `chrome124`, `chrome125`, `chrome131`, `chrome136`, `chrome142`, `chrome151` | Completes                               | HTTP 403 Cloudflare challenge | Usable for the bounded fast path                  |
+| `firefox`, `firefox128`, `firefox133`, `firefox135`, `firefox144`                      | Completes                               | HTTP 403 Cloudflare challenge | Usable for the bounded fast path                  |
+| `okhttp`, `okhttp3`, `okhttp4`, `okhttp5`                                              | Completes                               | HTTP 403 Cloudflare challenge | Usable for the bounded fast path                  |
+| `chrome100`, `chrome101`, `chrome104`, `chrome107`, `chrome110`, `chrome116`           | Rejected (`AlertReceived(DecodeError)`) | No response                   | Excluded - legacy TLS is refused by the edge      |
+| `ios18`                                                                                | Rejected (`AlertReceived(DecodeError)`) | No response                   | Excluded - iOS TLS profile is refused by the edge |
+
+The actor therefore cycles only through `chrome`, `chrome142`, `firefox`, and `okhttp5`. `ignoreTlsErrors` does not rescue the excluded profiles: their failure is a server-side TLS alert, not a certificate-trust problem.
+
+### Proxy behavior
+
+- Impit and Patchright were both verified end-to-end through an HTTP `CONNECT` proxy. Impit reaches the endpoint (HTTP 403 challenge) for every retained profile, and the Patchright Chrome session still clears the Cloudflare challenge and returns HTTP 200 from the same-origin API.
+- Impit direct requests always receive the Cloudflare challenge, even when replayed with a real browser `cf_clearance` cookie. The browser session is the authoritative data path; impit is only a fast-path probe.
+- On Apify cloud, egress/proxy TLS can terminate with a certificate authority that `rustls` does not trust, surfacing as `hyper_util::client::legacy::Error(Connect, Custom { kind: InvalidData, error: InvalidCertificate(UnknownIssuer) })`. The actor builds proxied impit clients with `ignoreTlsErrors: true` so this cannot abort the run; direct (non-proxied) runs keep strict certificate validation.
+- Residential routing is the recommended Apify Proxy group for the Cloudflare-protected storefront. Unblocker also works but is not required for this flow.
+
+### Browser (Patchright) stealth configuration
+
+The browser session uses Patchright's Pattern C persistent-context baseline, which is the configuration Patchright recommends and patches internally:
+
+- `channel: 'chrome'` - real Chrome, not bundled Chromium.
+- `headless: false` - headed, rendered under Xvfb on the Apify image.
+- `noViewport: true` - avoids viewport-related automation flags.
+- `launchPersistentContext` with a disposable, uniquely named profile per session.
+- No custom `userAgent`, `args`, or fingerprint headers. Patchright adds `--disable-blink-features=AutomationControlled` and removes `--enable-automation`, `--disable-popup-blocking`, and other flag leaks itself.
+- One proxy URL per context; a blocked or interrupted session is retired and rebuilt with a fresh profile and a fresh proxy session.
+
+Verified 2026-10-05: four consecutive clean sessions each cleared the Cloudflare challenge and returned HTTP 200 from the same-origin API in 15-20 seconds. The earlier single 90-second stall was transient and is covered by the recovery contract below.
+
+### Auto-healing contract
+
+1. Impit failures (HTTP 403/410, 429/5xx, or any thrown TLS/connect/timeout error) never fail the run. They hand off to browser recovery.
+2. Browser recovery creates a fresh persistent Chrome profile, clears the challenge by polling the same-origin API until it returns 2xx, and rotates to a new Apify Proxy session on a second attempt.
+3. If a challenge title does not clear within 45 seconds, the page is reloaded once (bounded) to restart a stalled interstitial before the ready timeout is reached.
+4. If an established browser session later starts returning 403/429 or errors, it is discarded and rebuilt automatically.
+5. Recovered pages keep using the documented cursor (`page_info.last` -> `after`) and output mapping; no input or output contract changes.
+
+### Diagnosis order for a failed run
+
+1. Re-read this file and confirm which profile and proxy path the run used.
+2. Check the logged `Impit (...)` warning: a TLS `ConnectError` means the profile or proxy TLS trust is the cause; an HTTP 403 means Cloudflare challenged that request and the browser path should have taken over.
+3. If the browser session itself fails, check for `ERR_TUNNEL_CONNECTION_FAILED` (proxy URL/protocol), a challenge page title that never clears (proxy IP reputation), or a navigation timeout (proxy session rotation).
 
 ## Rejected candidates
 
