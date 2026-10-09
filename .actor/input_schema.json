@@ -7,15 +7,16 @@
         "url": {
             "title": "Depop search URL",
             "type": "string",
-            "description": "A Depop search, localized search, category, or filtered search URL. When provided, URL filters are preserved and the URL takes priority over keyword.",
-            "editor": "textfield",
-            "prefill": "https://www.depop.com/search/?q=jersey"
+            "description": "A Depop search, localized search, category, or filtered search URL. When provided, URL filters are preserved and the URL takes priority over the keyword.",
+            "editor": "textfield"
         },
         "keyword": {
             "title": "Keyword",
             "type": "string",
-            "description": "Search phrase used when URL is empty, for example jersey, vintage Nike, or leather bag.",
-            "editor": "textfield"
+            "description": "Search phrase used when the URL field is empty, for example jersey, vintage Nike, or leather bag.",
+            "editor": "textfield",
+            "default": "jersey",
+            "prefill": "jersey"
         },
         "sort": {
             "title": "Sorting",
@@ -24,8 +25,7 @@
             "editor": "select",
             "enum": ["relevance", "newest", "priceAscending", "priceDescending", "popularity"],
             "enumTitles": ["Most relevant", "Newest", "Price: low to high", "Price: high to low", "Popularity"],
-            "default": "relevance",
-            "prefill": "relevance"
+            "default": "relevance"
         },
         "country": {
             "title": "Country storefront",
@@ -34,8 +34,7 @@
             "editor": "select",
             "enum": ["us", "uk", "au", "eu", "de", "fr", "it"],
             "enumTitles": ["United States", "United Kingdom", "Australia", "Europe", "Germany", "France", "Italy"],
-            "default": "us",
-            "prefill": "us"
+            "default": "us"
         },
         "results_wanted": {
             "title": "Results wanted",
@@ -43,7 +42,6 @@
             "description": "Maximum number of listing records to save.",
             "minimum": 1,
             "default": 20,
-            "prefill": 20,
             "editor": "number"
         },
         "max_pages": {
@@ -52,17 +50,16 @@
             "description": "Maximum number of API pages to request. Each page contains up to 24 listings.",
             "minimum": 1,
             "default": 10,
-            "prefill": 3,
             "editor": "number"
         },
         "proxyConfiguration": {
             "title": "Proxy configuration",
             "type": "object",
-            "description": "Optional Apify Proxy configuration. Residential routing is recommended for protected storefronts.",
+            "description": "Apify Proxy configuration. Unblocker is the default because it clears this storefront's Cloudflare challenge fastest and most reliably (billed at 10 units per successful request). Switch to Residential for a lower-cost option.",
             "editor": "proxy",
             "default": {
                 "useApifyProxy": true,
-                "apifyProxyGroups": ["RESIDENTIAL"]
+                "apifyProxyGroups": ["UNBLOCKER"]
             }
         }
     },

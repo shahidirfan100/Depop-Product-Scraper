@@ -1,11 +1,10 @@
 {
     "name": "depop-product-scraper",
     "version": "1.0",
-    "description": "API-based Depop product scraper using impit.",
+    "description": "Depop product scraper using Patchright stealth browser fetching.",
     "type": "module",
     "dependencies": {
         "apify": "^3.7.2",
-        "impit": "^0.14.3",
         "patchright": "^1.63.0"
     },
     "devDependencies": {

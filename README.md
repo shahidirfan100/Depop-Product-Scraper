@@ -44,17 +44,17 @@ It is useful for fashion market research, resale sourcing, competitor monitoring
 
 ## Input Parameters
 
-| Parameter            | Type    | Required | Default                     | Description                                                                                |
-| -------------------- | ------- | -------- | --------------------------- | ------------------------------------------------------------------------------------------ |
-| `url`                | String  | No*      | Depop jersey search example | Depop search, localized search, category, or filtered search URL.                          |
-| `keyword`            | String  | No*      | `jersey`                    | Search phrase used when `url` is empty.                                                    |
-| `sort`               | String  | No       | `relevance`                 | `relevance`, `newest`, `priceAscending`, `priceDescending`, or `popularity`.               |
-| `results_wanted`     | Integer | No       | `20`                        | Maximum number of records to save.                                                         |
-| `max_pages`          | Integer | No       | `10`                        | Maximum number of result pages to request.                                                 |
-| `country`            | String  | No       | `us`                        | Storefront: `us`, `uk`, `au`, `eu`, `de`, `fr`, or `it`. A locale in `url` takes priority. |
-| `proxyConfiguration` | Object  | No       | Not set                     | Optional Apify Proxy configuration.                                                        |
+| Parameter            | Type    | Required | Default         | Description                                                                                                       |
+| -------------------- | ------- | -------- | --------------- | ----------------------------------------------------------------------------------------------------------------- |
+| `url`                | String  | No*      | Not set         | Depop search, localized search, category, or filtered search URL.                                                 |
+| `keyword`            | String  | No*      | `jersey`        | Search phrase used when `url` is empty.                                                                           |
+| `sort`               | String  | No       | `relevance`     | `relevance`, `newest`, `priceAscending`, `priceDescending`, or `popularity`.                                      |
+| `results_wanted`     | Integer | No       | `20`            | Maximum number of records to save.                                                                                |
+| `max_pages`          | Integer | No       | `10`            | Maximum number of result pages to request.                                                                        |
+| `country`            | String  | No       | `us`            | Storefront: `us`, `uk`, `au`, `eu`, `de`, `fr`, or `it`. A locale in `url` takes priority.                        |
+| `proxyConfiguration` | Object  | No       | Apify Unblocker | Apify Proxy settings. Unblocker clears challenges fastest and is the default; Residential is a lower-cost option. |
 
-\* Provide either `url` or `keyword`. If both are provided, the URL is used and its filters are preserved.
+\* Provide either `url` or `keyword`. If both are provided, the URL is used and its filters are preserved. The keyword field is prefilled with `jersey` for quick tests; clear it when you want the run input to be unambiguous.
 
 ## Usage Examples
 
@@ -142,7 +142,7 @@ Collect UK-priced results from a localized search page:
 - Start with `results_wanted: 20` while checking a new keyword or filter combination.
 - Use `sort: newest` for new-listing monitoring and `priceAscending` for sourcing workflows.
 - Set `max_pages` high enough to cover the requested result count. Each page can contain up to 24 listings.
-- Use a suitable Apify Proxy configuration if Depop challenges requests from your region.
+- Apify Unblocker proxy is the default for the fastest, most reliable challenge clearing (billed at 10 units per successful request). Switch to Residential for a lower-cost option.
 - Some fields are only published for certain listings. Missing fields are omitted from the record instead of being saved as null.
 
 ## Integrations and export formats

@@ -76,12 +76,12 @@ The successful response had this shape:
 
 ## Implementation decision
 
-1. A bounded Impit fast path still runs first. It rotates once through a small pool of known-good TLS profiles (`chrome`, `chrome142`, `firefox`, `okhttp5`). On a challenged IP it returns HTTP 403/410 and stops rotating immediately; any thrown transport error (TLS, connect, timeout) is also treated as a recovery signal, never a fatal stop, and the actor falls back to the browser session without wasting time.
+1. Patchright is the only data path. The Impit fast path was removed on 2026-10-09: through Unblocker it succeeded for the first few pages and then started timing out and getting blocked mid-run, so the browser session is now always used for fetching.
 2. Recovery opens the public Depop homepage in Patchright (persistent Chrome context). It waits for the Cloudflare challenge to clear and then confirms readiness by probing the same-origin API until it returns 2xx.
-3. Pages are fetched with `page.evaluate(fetch(...))` from that same origin using the session cookies, and paginated with `page_info.last` as the `after` parameter.
+3. Pages are fetched with `page.evaluate(fetch(...))` from that same origin using the session cookies, and paginated with `page_info.last` as the `after` parameter. The established session is reused for every page and only rebuilt if it starts failing.
 4. The browser bootstrap reads only JSON API responses. It does not use DOM selectors, HTML parsing, JSON-LD, RSC extraction, or intercepted request headers.
 
-If a browser session still receives a temporary block, one bounded retry rotates to a new Apify Proxy session when proxying is configured.
+If a browser session still receives a temporary block, bounded retries rotate to a new Apify Proxy session and a fresh profile when proxying is configured.
 
 URL filters are translated into API parameters where the endpoint exposes the same filter. Search, localized search, category, and filtered search URLs are supported. A keyword is converted into the same `what` parameter when no URL is supplied. A URL takes precedence over the keyword.
 
@@ -89,9 +89,9 @@ URL filters are translated into API parameters where the endpoint exposes the sa
 
 Read this section first whenever a run fails.
 
-### Impit browser profiles
+### Impit browser profiles (historical - fast path removed)
 
-Every documented `Impit` profile was probed against the live endpoint. Profiles split into two clear groups:
+The Impit fast path was removed on 2026-10-09 because it timed out and got blocked mid-run through Unblocker. This matrix is retained as discovery evidence. Every documented `Impit` profile was probed against the live endpoint. Profiles split into two clear groups:
 
 | Profiles                                                                               | TLS handshake                           | Response                      | Decision                                          |
 | -------------------------------------------------------------------------------------- | --------------------------------------- | ----------------------------- | ------------------------------------------------- |
@@ -101,14 +101,21 @@ Every documented `Impit` profile was probed against the live endpoint. Profiles 
 | `chrome100`, `chrome101`, `chrome104`, `chrome107`, `chrome110`, `chrome116`           | Rejected (`AlertReceived(DecodeError)`) | No response                   | Excluded - legacy TLS is refused by the edge      |
 | `ios18`                                                                                | Rejected (`AlertReceived(DecodeError)`) | No response                   | Excluded - iOS TLS profile is refused by the edge |
 
-The actor therefore cycles only through `chrome`, `chrome142`, `firefox`, and `okhttp5`. `ignoreTlsErrors` does not rescue the excluded profiles: their failure is a server-side TLS alert, not a certificate-trust problem.
+The removed fast path cycled through `chrome`, `chrome142`, `firefox`, and `okhttp5`. `ignoreTlsErrors` does not rescue the excluded profiles: their failure is a server-side TLS alert, not a certificate-trust problem.
 
 ### Proxy behavior
 
-- Impit and Patchright were both verified end-to-end through an HTTP `CONNECT` proxy. Impit reaches the endpoint (HTTP 403 challenge) for every retained profile, and the Patchright Chrome session still clears the Cloudflare challenge and returns HTTP 200 from the same-origin API.
-- Impit direct requests always receive the Cloudflare challenge, even when replayed with a real browser `cf_clearance` cookie. The browser session is the authoritative data path; impit is only a fast-path probe.
-- On Apify cloud, egress/proxy TLS can terminate with a certificate authority that `rustls` does not trust, surfacing as `hyper_util::client::legacy::Error(Connect, Custom { kind: InvalidData, error: InvalidCertificate(UnknownIssuer) })`. The actor builds proxied impit clients with `ignoreTlsErrors: true` so this cannot abort the run; direct (non-proxied) runs keep strict certificate validation.
-- Residential routing is the recommended Apify Proxy group for the Cloudflare-protected storefront. Unblocker also works but is not required for this flow.
+- Patchright is the only data path. Direct HTTP requests (Impit) always receive the Cloudflare challenge, even when replayed with a real browser `cf_clearance` cookie, and through Unblocker they succeeded only briefly before timing out mid-run. The browser session is authoritative.
+- Residential is the cost-effective Apify Proxy group for the Cloudflare-protected storefront. It usually clears the challenge, but a challenged residential IP can need a second session before it clears.
+- Unblocker is the fastest and most reliable path and is the **default** as of 2026-10-09. Unblocker solves the Cloudflare challenge server-side. It has no sticky session, so no session ID is passed, and it intercepts TLS with a CA Chrome does not trust. The browser context therefore sets `ignoreHTTPSErrors: true` **only** on the explicit Unblocker path; direct and Residential runs keep strict certificate validation. Unblocker bills 10 units per successful request; switch to Residential for a lower-cost option.
+
+### Verified proxy outcomes (2026-10-09)
+
+| Proxy group   | Browser path                     | Result                                                    |
+| ------------- | -------------------------------- | --------------------------------------------------------- |
+| UNBLOCKER     | Works, `ignoreHTTPSErrors: true` | Succeeded, 48 items across 3 pages, first page in ~3 s    |
+| RESIDENTIAL   | Clears after 1-2 sessions        | Succeeded, 20-96 items; one run needed a session rotation |
+| None (direct) | Clears on a clean IP             | Succeeded locally, 20 items                               |
 
 ### Browser (Patchright) stealth configuration
 
@@ -120,22 +127,34 @@ The browser session uses Patchright's Pattern C persistent-context baseline, whi
 - `launchPersistentContext` with a disposable, uniquely named profile per session.
 - No custom `userAgent`, `args`, or fingerprint headers. Patchright adds `--disable-blink-features=AutomationControlled` and removes `--enable-automation`, `--disable-popup-blocking`, and other flag leaks itself.
 - One proxy URL per context; a blocked or interrupted session is retired and rebuilt with a fresh profile and a fresh proxy session.
+- Apify Unblocker intercepts TLS with an untrusted CA, so `ignoreHTTPSErrors: true` is set only on the explicit Unblocker path; Residential and direct runs keep strict certificate validation.
 
 Verified 2026-10-05: four consecutive clean sessions each cleared the Cloudflare challenge and returned HTTP 200 from the same-origin API in 15-20 seconds. The earlier single 90-second stall was transient and is covered by the recovery contract below.
 
 ### Auto-healing contract
 
-1. Impit failures (HTTP 403/410, 429/5xx, or any thrown TLS/connect/timeout error) never fail the run. They hand off to browser recovery.
-2. Browser recovery creates a fresh persistent Chrome profile, clears the challenge by polling the same-origin API until it returns 2xx, and rotates to a new Apify Proxy session on a second attempt.
-3. If a challenge title does not clear within 45 seconds, the page is reloaded once (bounded) to restart a stalled interstitial before the ready timeout is reached.
-4. If an established browser session later starts returning 403/429 or errors, it is discarded and rebuilt automatically.
-5. Recovered pages keep using the documented cursor (`page_info.last` -> `after`) and output mapping; no input or output contract changes.
+1. Patchright is the only fetch path, so there is no direct-HTTP fast path to fail. Every page is fetched from the established same-origin browser session.
+2. Browser recovery creates up to 3 fresh persistent Chrome profiles. Attempt 1 reuses the pre-created Apify Proxy session; every later attempt rotates to a new proxy session and a new profile, so a blocked or interrupted IP is never reused.
+3. Readiness is confirmed only by a 2xx JSON response from the same-origin API, polled every 3 s for up to 70 s. The title check is secondary and only decides when to reload a stalled interstitial.
+4. If a challenge does not clear within 30 s, the page is reloaded once (bounded) before the ready timeout is reached.
+5. If an established browser session later starts returning 403/429, a non-JSON body, or errors, it is discarded and rebuilt automatically.
+6. Parsing is tolerant: item arrays are read from `objects`, `products`, `results`, `items`, nested `data.*`, or `meta.objects`, and the cursor from `page_info`/`meta`. A 2xx HTML body is treated as a not-ready challenge rather than a hard failure.
+7. Session close never throws, so cleanup can never mask the original failure. Recovered pages keep using the documented cursor (`page_info.last` -> `after`) and output mapping; no input or output contract changes.
 
 ### Diagnosis order for a failed run
 
 1. Re-read this file and confirm which profile and proxy path the run used.
 2. Check the logged `Impit (...)` warning: a TLS `ConnectError` means the profile or proxy TLS trust is the cause; an HTTP 403 means Cloudflare challenged that request and the browser path should have taken over.
 3. If the browser session itself fails, check for `ERR_TUNNEL_CONNECTION_FAILED` (proxy URL/protocol), a challenge page title that never clears (proxy IP reputation), or a navigation timeout (proxy session rotation).
+4. Confirm the challenge title is recognized. Depop served the title **"Checking if the connection is secure."** with a Cloudflare Turnstile widget. The earlier challenge-title regex did not match it, so readiness kept polling the API to the timeout and the run failed with `last: HTTP 403`. The regex now covers this and the readiness probe no longer depends on the title to detect a cleared challenge.
+
+### 2026-10-09 failure and fix
+
+Observed run: Impit `chrome` timed out after 30 s, the direct JSON request returned HTTP 403, and both browser sessions failed with `Depop Cloudflare verification did not complete in time`. Root causes and fixes:
+
+- The 30 s Impit timeout burned run budget on a proxy that could not connect. Fixed with a 12 s per-request timeout and a 15 s fast-path budget, stopping on the first transport error.
+- The challenge title `Checking if the connection is secure.` was not in the detection regex. Fixed by broadening the regex and making the API probe the authoritative readiness signal on every poll.
+- Only 2 browser sessions were attempted, each with a 90 s ready timeout, so the run could not recover. Fixed with 3 attempts, a 70 s ready timeout, a 30 s bounded reload, and a fresh proxy session plus profile on every retry.
 
 ## Rejected candidates
 

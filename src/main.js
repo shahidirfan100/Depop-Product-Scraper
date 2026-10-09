@@ -4,22 +4,17 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { Actor, log } from 'apify';
-import { Impit } from 'impit';
 import { chromium } from 'patchright';
 
 const API_HOST = 'https://www.depop.com';
 const API_PATH = '/presentation/api/v1/search/products/';
 const PAGE_SIZE = 24;
 const MAX_RETRIES = 3;
-const MAX_BROWSER_SESSIONS = 2;
-const BROWSER_READY_TIMEOUT_MS = 90000;
-const BROWSER_READY_POLL_MS = 4000;
-const CHALLENGE_RELOAD_AFTER_MS = 45000;
-const IMPIT_TIMEOUT_MS = 30000;
-// Verified against Depop: chrome, chrome124+, firefox*, and okhttp* complete the
-// TLS handshake, while chrome100-116 and ios18 are rejected at the TLS layer.
-// Rotating through this known-good set keeps the fast path resilient.
-const IMPIT_PROFILES = ['chrome', 'chrome142', 'firefox', 'okhttp5'];
+const MAX_BROWSER_SESSIONS = 3;
+const BROWSER_READY_TIMEOUT_MS = 70000;
+const BROWSER_READY_POLL_MS = 3000;
+const BROWSER_FETCH_TIMEOUT_MS = 20000;
+const CHALLENGE_RELOAD_AFTER_MS = 30000;
 const SUPPORTED_SORTS = new Set(['relevance', 'newest', 'priceAscending', 'priceDescending', 'popularity']);
 
 function cleanValue(value) {
@@ -218,18 +213,29 @@ function mapListing(item) {
     });
 }
 
+// Tolerant extraction: the documented shape is `objects`, but the endpoint has
+// historically used sibling and nested keys. Pick the first array that is present
+// instead of hard-failing on one shape.
 function extractItems(data) {
-    if (Array.isArray(data?.objects)) return data.objects;
-    if (Array.isArray(data?.products)) return data.products;
-    if (Array.isArray(data?.results)) return data.results;
-    if (Array.isArray(data?.data)) return data.data;
-    return [];
+    const candidates = [
+        data?.objects,
+        data?.products,
+        data?.results,
+        data?.items,
+        data?.data,
+        data?.data?.objects,
+        data?.data?.products,
+        data?.data?.results,
+        data?.meta?.objects,
+    ];
+    return candidates.find((candidate) => Array.isArray(candidate)) || [];
 }
 
 function getNextPage(data) {
+    const pageInfo = data?.page_info || data?.data?.page_info || data?.meta || data?.data?.meta || {};
     return {
-        hasMore: Boolean(data?.page_info?.has_more ?? data?.meta?.has_more),
-        cursor: data?.page_info?.last || data?.meta?.cursor || data?.meta?.next_cursor,
+        hasMore: Boolean(pageInfo.has_more ?? pageInfo.hasMore),
+        cursor: pageInfo.last || pageInfo.next_cursor || pageInfo.cursor || pageInfo.after,
     };
 }
 
@@ -276,101 +282,85 @@ async function closeBrowserSession(session) {
 
     try {
         await session.context.close();
+    } catch (error) {
+        // A failed close must never mask the original failure that triggered recovery.
+        log.warning(`Closing the browser session failed: ${String(error.message).split('\n')[0]}`);
     } finally {
-        if (session.profilePath) await rm(session.profilePath, { force: true, recursive: true });
-    }
-}
-
-function buildRequestHeaders(referer) {
-    return {
-        accept: 'application/json',
-        referer,
-        'depop-device-id': randomUUID(),
-        'depop-session-id': randomUUID(),
-        'depop-search-id': randomUUID(),
-    };
-}
-
-// Build the profile pool once and reuse it (one client per profile, not per
-// request). Rotating profiles across attempts survives a fingerprint that the
-// target rejects at the TLS layer.
-function createImpitClients(proxyUrl) {
-    return IMPIT_PROFILES.map((browser) => ({
-        browser,
-        client: new Impit({
-            browser,
-            timeout: IMPIT_TIMEOUT_MS,
-            // Some proxies terminate TLS with a CA that rustls does not trust,
-            // surfacing as `InvalidCertificate(UnknownIssuer)`. Relax verification
-            // only when traffic is routed through a proxy; direct runs stay strict.
-            ...(proxyUrl && { ignoreTlsErrors: true, proxyUrl }),
-        }),
-    }));
-}
-
-// Bounded fast path. Each known-good profile is probed once. Depop answers the
-// cookieless request shape with a deterministic 403/410 challenge, so rotation
-// stops there and the browser recovery path takes over. Any thrown transport
-// error (TLS, connect, timeout) is also a signal to recover, never a fatal stop.
-async function fetchJsonFastPath(clients, url, referer) {
-    let lastStatus;
-    for (const { browser, client } of clients) {
-        let response;
-        try {
-            response = await client.fetch(url, {
-                headers: buildRequestHeaders(referer),
-                redirect: 'follow',
-            });
-        } catch (error) {
-            log.warning(`Impit (${browser}) request failed: ${String(error.message).split('\n')[0]}`);
-            continue;
+        if (session.profilePath) {
+            await rm(session.profilePath, { force: true, recursive: true }).catch(() => {});
         }
-
-        if (response.ok) {
-            try {
-                return await response.json();
-            } catch (error) {
-                log.warning(`Impit (${browser}) returned a non-JSON response: ${error.message}`);
-                continue;
-            }
-        }
-
-        lastStatus = response.status;
-        if ([403, 410].includes(response.status)) break;
-        if (response.status === 429 || response.status >= 500) await sleep(1000);
     }
-
-    if (lastStatus) {
-        log.warning(`Direct JSON requests returned HTTP ${lastStatus}; bootstrapping a browser API session.`);
-    }
-    return undefined;
 }
 
+// Cloudflare serves several interstitial titles. "Checking if the connection is
+// secure." was observed live on Depop and was not matched by the earlier regex,
+// so the actor kept probing the API until the ready timeout instead of reloading
+// or rotating. Keep this list broad and title-empty treated as challenged.
 function isChallengePage(title) {
     const trimmed = String(title || '').trim();
     if (!trimmed) return true;
-    return /just a moment|attention required|checking your browser|verify you are human|^loading\s/i.test(trimmed);
-}
-
-async function evaluateBrowserFetch(page, url) {
-    return page.evaluate(
-        async ({ targetUrl }) => {
-            const response = await fetch(targetUrl, {
-                credentials: 'include',
-                headers: { Accept: 'application/json' },
-            });
-            return {
-                status: response.status,
-                body: await response.text(),
-            };
-        },
-        { targetUrl: url },
+    return /just a moment|attention required|checking your browser|checking if the connection is secure|verify you are human|verifying you are human|security check|one more step|please wait|enable javascript|ddos protection|^loading\b/i.test(
+        trimmed,
     );
 }
 
-// Depop server-renders search results and gates the whole site behind a Cloudflare
-// challenge. The browser must first clear that challenge before the same-origin
-// JSON API accepts requests, so readiness is confirmed by probing the API itself.
+// Same-origin browser fetch. Running inside the page keeps the request on the
+// Cloudflare-cleared origin and lets the real browser supply all headers,
+// cookies, and TLS values, so nothing here is hardcoded. A bounded AbortController
+// stops a hung request from stalling the run.
+async function evaluateBrowserFetch(page, url) {
+    return page.evaluate(
+        async ({ targetUrl, timeoutMs }) => {
+            const controller = new AbortController();
+            const timer = setTimeout(() => controller.abort(), timeoutMs);
+            try {
+                const response = await fetch(targetUrl, {
+                    method: 'GET',
+                    credentials: 'include',
+                    cache: 'no-store',
+                    redirect: 'follow',
+                    headers: { Accept: 'application/json' },
+                    signal: controller.signal,
+                });
+                const body = await response.text();
+                return {
+                    status: response.status,
+                    contentType: response.headers.get('content-type') || '',
+                    body,
+                };
+            } catch (error) {
+                return {
+                    status: 0,
+                    contentType: '',
+                    body: '',
+                    error: String((error && error.message) || error),
+                };
+            } finally {
+                clearTimeout(timer);
+            }
+        },
+        { targetUrl: url, timeoutMs: BROWSER_FETCH_TIMEOUT_MS },
+    );
+}
+
+// Parse a same-origin response body. A challenge or redirect can return HTML with
+// a 2xx status, so a body that starts with '<' is treated as not-ready rather
+// than a hard failure.
+function parseJsonBody(result) {
+    const body = String(result?.body || '').trim();
+    if (!body || body.startsWith('<')) return undefined;
+    try {
+        return JSON.parse(body);
+    } catch {
+        return undefined;
+    }
+}
+
+// Depop gates the whole site behind a Cloudflare challenge and the JSON API
+// rejects requests until that challenge clears. Readiness is therefore confirmed
+// by probing the API on every poll: a 2xx JSON response is the only success
+// signal. The title check only decides when a stalled challenge should be
+// reloaded, so a title variant can never silently skip recovery.
 async function waitForBrowserSession(page, probeUrl, timeoutMs) {
     const deadline = Date.now() + timeoutMs;
     let lastStatus = 'no response';
@@ -379,6 +369,24 @@ async function waitForBrowserSession(page, probeUrl, timeoutMs) {
 
     while (Date.now() < deadline) {
         if (page.isClosed()) throw new Error('The browser page closed before the Depop session was ready.');
+
+        let probe;
+        try {
+            probe = await evaluateBrowserFetch(page, probeUrl);
+        } catch (error) {
+            lastStatus = String(error.message).split('\n')[0];
+            await sleep(BROWSER_READY_POLL_MS);
+            continue;
+        }
+
+        if (probe.status >= 200 && probe.status < 300 && parseJsonBody(probe)) return;
+        if (probe.status >= 200 && probe.status < 300) {
+            lastStatus = 'HTTP 200 (non-JSON challenge body)';
+        } else if (probe.error) {
+            lastStatus = probe.error;
+        } else {
+            lastStatus = `HTTP ${probe.status}`;
+        }
 
         const title = await page.title().catch(() => '');
         if (isChallengePage(title)) {
@@ -390,24 +398,10 @@ async function waitForBrowserSession(page, probeUrl, timeoutMs) {
                 log.warning('Cloudflare challenge is taking long; reloading the page once.');
                 await page.reload({ waitUntil: 'commit', timeout: 60000 }).catch(() => {});
             }
-            await sleep(BROWSER_READY_POLL_MS);
-            continue;
+        } else {
+            challengeSince = Date.now();
         }
 
-        challengeSince = Date.now();
-
-        let probe;
-        try {
-            probe = await evaluateBrowserFetch(page, probeUrl);
-        } catch (error) {
-            lastStatus = error.message;
-            await sleep(BROWSER_READY_POLL_MS);
-            continue;
-        }
-
-        if (probe.status >= 200 && probe.status < 300) return;
-
-        lastStatus = `HTTP ${probe.status}`;
         await sleep(BROWSER_READY_POLL_MS);
     }
 
@@ -421,17 +415,20 @@ async function fetchJsonFromBrowser(page, url) {
             result = await evaluateBrowserFetch(page, url);
         } catch (error) {
             if (attempt === MAX_RETRIES) throw error;
-            log.warning(`Browser API retry ${attempt}/${MAX_RETRIES} after error: ${error.message}`);
+            log.warning(
+                `Browser API retry ${attempt}/${MAX_RETRIES} after error: ${String(error.message).split('\n')[0]}`,
+            );
             await sleep(attempt * 1500);
             continue;
         }
 
         if (result.status >= 200 && result.status < 300) {
-            try {
-                return JSON.parse(result.body);
-            } catch (error) {
-                throw new Error(`Depop browser API returned a non-JSON response: ${error.message}`);
-            }
+            const data = parseJsonBody(result);
+            if (data) return data;
+            if (attempt === MAX_RETRIES) throw new Error('Depop browser API returned a non-JSON response.');
+            log.warning(`Browser API retry ${attempt}/${MAX_RETRIES} after a non-JSON response.`);
+            await sleep(attempt * 2000);
+            continue;
         }
 
         if (attempt < MAX_RETRIES && [403, 429].includes(result.status)) {
@@ -446,7 +443,7 @@ async function fetchJsonFromBrowser(page, url) {
     throw new Error('Browser API retries exhausted.');
 }
 
-async function createBrowserApiSession(probeUrl, proxyUrl) {
+async function createBrowserApiSession(probeUrl, proxyUrl, ignoreHttpsErrors) {
     const profilePath = await mkdtemp(join(tmpdir(), 'depop-browser-'));
     let context;
 
@@ -455,10 +452,16 @@ async function createBrowserApiSession(probeUrl, proxyUrl) {
         // Apify image), persistent context, and no custom viewport/user-agent/
         // fingerprint headers. Patchright patches the automation flags itself, so
         // no manual `--disable-blink-features` or header overrides are added.
+        //
+        // Apify Unblocker performs TLS interception with a CA Chrome does not
+        // trust, so it surfaces as `ERR_CERT_AUTHORITY_INVALID`. That exception is
+        // scoped to the explicit Unblocker path only; direct and Residential runs
+        // keep strict certificate validation.
         context = await chromium.launchPersistentContext(profilePath, {
             channel: 'chrome',
             headless: false,
             noViewport: true,
+            ...(ignoreHttpsErrors && { ignoreHTTPSErrors: true }),
             ...(proxyUrl && { proxy: getBrowserProxy(proxyUrl) }),
         });
         const page = await context.newPage();
@@ -468,51 +471,40 @@ async function createBrowserApiSession(probeUrl, proxyUrl) {
 
         return { context, page, profilePath };
     } catch (error) {
-        try {
-            if (context) await context.close();
-        } finally {
-            await rm(profilePath, { force: true, recursive: true });
-        }
+        if (context) await closeBrowserSession({ context, profilePath });
+        else await rm(profilePath, { force: true, recursive: true }).catch(() => {});
         throw error;
     }
 }
 
-async function fetchWithBrowserRecovery(primaryUrl, proxyConfiguration, proxyUrl, browserSession, useProxySession) {
-    let session = browserSession;
+// Establish a Depop browser API session and fetch the first page. Each attempt
+// builds a fresh Patchright Chrome profile and, when a proxy is configured, a
+// fresh Apify Proxy session, so a blocked or interrupted IP is never reused.
+// The first attempt reuses the pre-created proxy URL; later attempts rotate.
+async function openBrowserData(primaryUrl, proxyConfiguration, initialProxyUrl, useProxySession, ignoreHttpsErrors) {
+    let lastError;
 
-    if (session) {
+    for (let attempt = 1; attempt <= MAX_BROWSER_SESSIONS; attempt++) {
+        let browserProxyUrl = initialProxyUrl;
+        if (proxyConfiguration && attempt > 1) {
+            browserProxyUrl = await getProxyUrl(proxyConfiguration, useProxySession);
+        }
+
+        let session;
         try {
+            session = await createBrowserApiSession(primaryUrl, browserProxyUrl, ignoreHttpsErrors);
             const data = await fetchJsonFromBrowser(session.page, primaryUrl);
             return { data, browserSession: session };
         } catch (error) {
-            log.warning(`Existing browser session failed: ${error.message}; starting a fresh session.`);
-            await closeBrowserSession(session);
-            session = undefined;
+            lastError = error;
+            if (session) await closeBrowserSession(session);
+            log.warning(
+                `Browser session ${attempt}/${MAX_BROWSER_SESSIONS} failed: ${String(error.message).split('\n')[0]}`,
+            );
         }
     }
 
-    let lastBrowserError;
-    for (let sessionAttempt = 1; sessionAttempt <= MAX_BROWSER_SESSIONS; sessionAttempt++) {
-        let browserProxyUrl;
-        if (proxyUrl || Actor.isAtHome()) {
-            browserProxyUrl = sessionAttempt === 1 ? proxyUrl : await getProxyUrl(proxyConfiguration, useProxySession);
-        }
-
-        try {
-            session = await createBrowserApiSession(primaryUrl, browserProxyUrl);
-            const data = await fetchJsonFromBrowser(session.page, primaryUrl);
-            return { data, browserSession: session };
-        } catch (error) {
-            lastBrowserError = error;
-            if (session) {
-                await closeBrowserSession(session);
-                session = undefined;
-            }
-            log.warning(`Browser session ${sessionAttempt}/${MAX_BROWSER_SESSIONS} failed: ${error.message}`);
-        }
-    }
-
-    throw lastBrowserError || new Error('Unable to establish a Depop browser API session.');
+    throw lastError || new Error('Unable to establish a Depop browser API session.');
 }
 
 async function main() {
@@ -554,9 +546,12 @@ async function main() {
             });
         }
 
-        const useProxySession = !usesUnblocker(proxyConfig);
+        // Unblocker has no sticky session and performs TLS interception, so it
+        // must not receive a session ID and its browser context must ignore the
+        // intercepted certificate. Residential keeps sessions and strict TLS.
+        const unblocker = usesUnblocker(proxyConfig);
+        const useProxySession = !unblocker;
         const proxyUrl = proxyConfiguration ? await getProxyUrl(proxyConfiguration, useProxySession) : undefined;
-        const impitClients = createImpitClients(proxyUrl);
 
         const seen = new Set();
         let cursor;
@@ -568,27 +563,30 @@ async function main() {
             const params = getQueryParams(searchUrl, input, apiCountry, currency, cursor);
             const primaryUrl = `${API_HOST}${API_PATH}?${params.toString()}`;
             let data;
+
+            // Patchright is the only data path. Reuse the established session; if
+            // it starts returning 403/429 or errors mid-pagination, discard it and
+            // rebuild automatically with a fresh profile and proxy session.
             if (browserSession) {
-                ({ data, browserSession } = await fetchWithBrowserRecovery(
+                try {
+                    data = await fetchJsonFromBrowser(browserSession.page, primaryUrl);
+                } catch (error) {
+                    log.warning(
+                        `Existing browser session failed: ${String(error.message).split('\n')[0]}; starting a fresh session.`,
+                    );
+                    await closeBrowserSession(browserSession);
+                    browserSession = undefined;
+                }
+            }
+
+            if (!data) {
+                ({ data, browserSession } = await openBrowserData(
                     primaryUrl,
                     proxyConfiguration,
                     proxyUrl,
-                    browserSession,
                     useProxySession,
+                    unblocker,
                 ));
-            } else {
-                const fastPathData = await fetchJsonFastPath(impitClients, primaryUrl, searchUrl.href);
-                if (fastPathData) {
-                    data = fastPathData;
-                } else {
-                    ({ data, browserSession } = await fetchWithBrowserRecovery(
-                        primaryUrl,
-                        proxyConfiguration,
-                        proxyUrl,
-                        browserSession,
-                        useProxySession,
-                    ));
-                }
             }
 
             const rawItems = extractItems(data);
